@@ -584,6 +584,39 @@ async def on_ready():
     except Exception:
         logger.exception("Failed to fetch commands on_ready")
 
+# 🛠 デバッグ: このチャンネルでコマンドが見えるはずか？ を診断
+@bot.tree.command(name=ls("debug", ja="デバッグ"), description=ls("Debug command visibility", ja="コマンド可視性を診断します"))
+async def debug(inter: discord.Interaction):
+    # 1) ギルドに何コマンド登録済みか
+    guild_cmds = await bot.tree.fetch_commands(guild=inter.guild)  # type: ignore
+    names = [c.name for c in guild_cmds]
+
+    # 2) このチャンネルの権限（@everyone 目線）
+    everyone = inter.guild.default_role  # type: ignore
+    ch_perms_everyone = inter.channel.permissions_for(everyone)  # type: ignore
+
+    # 3) Bot 自身の権限
+    me_member = inter.guild.me  # type: ignore
+    ch_perms_me = inter.channel.permissions_for(me_member)  # type: ignore
+
+    def yn(b: bool) -> str:
+        return "✅" if b else "❌"
+
+    # discord.py 2.x Permissions フラグ
+    can_use_app_cmds_everyone = getattr(ch_perms_everyone, "use_application_commands", False)
+    can_use_app_cmds_me = getattr(ch_perms_me, "use_application_commands", False)
+    can_send = ch_perms_me.send_messages and ch_perms_me.read_messages and ch_perms_me.read_message_history
+    can_embed = ch_perms_me.embed_links
+
+    e = discord.Embed(title="デバッグ: コマンド可視性", color=0x95a5a6)
+    e.add_field(name="登録コマンド数", value=str(len(guild_cmds)), inline=True)
+    e.add_field(name="登録コマンド一覧", value=", ".join(names) or "(なし)", inline=False)
+    e.add_field(name="このチャンネルの @everyone", value=f"Use Application Commands: {yn(can_use_app_cmds_everyone)}", inline=False)
+    e.add_field(name="このチャンネルの Bot 権限", value=(
+        f"Use Application Commands: {yn(can_use_app_cmds_me)}\n"
+        f"Send Messages: {yn(can_send)} / Embed Links: {yn(can_embed)}"
+    ), inline=False)
+    await inter.response.send_message(embed=e, ephemeral=True)
 # =============================
 # 🚀 起動
 # =============================
@@ -591,3 +624,4 @@ if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise SystemExit("環境変数 DISCORD_TOKEN が未設定です")
     bot.run(DISCORD_TOKEN)
+
