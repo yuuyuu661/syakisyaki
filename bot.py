@@ -145,18 +145,43 @@ class YenBot(commands.Bot):
         self.db = await aiosqlite.connect(DB_PATH)
         await self.db.executescript(INIT_SQL)
         await self.db.commit()
+        # --- スラッシュコマンドの即時反映対策 ---
+        # 1) まずはグローバル定義を各ギルドにコピー
+        # 2) その後、各ギルドで個別同期（これで数秒で反映される）
         if GUILD_IDS:
             for gid in GUILD_IDS:
+                obj = discord.Object(id=gid)
                 try:
-                    await self.tree.sync(guild=discord.Object(id=gid))
-                    logger.info(f"Synced commands to guild {gid}")
+                    self.tree.copy_global_to(guild=obj)
+                    synced = await self.tree.sync(guild=obj)
+                    logger.info(f"Synced {len(synced)} commands to guild {gid}")
                 except Exception as e:
                     logger.exception(e)
         else:
-            await self.tree.sync()
-            logger.info("Synced commands globally")
+            # グローバル同期（反映に最大1時間かかる）
+            synced = await self.tree.sync()
+            logger.info(f"Synced {len(synced)} global commands")
 
 bot = YenBot()
+
+@bot.event
+async def on_ready():
+    try:
+        if GUILD_IDS:
+            for gid in GUILD_IDS:
+                guild = bot.get_guild(gid)
+                if guild:
+                    cmds = await bot.tree.fetch_commands(guild=guild)
+                    names = [c.name for c in cmds]
+                    logger.info(f"Guild {gid} commands: {len(cmds)} -> {names}")
+                else:
+                    logger.warning(f"Guild {gid} not found in cache.")
+        else:
+            cmds = await bot.tree.fetch_commands()
+            names = [c.name for c in cmds]
+            logger.info(f"Global commands: {len(cmds)} -> {names}")
+    except Exception:
+        logger.exception("Failed to fetch commands on_ready")
 ls = app_commands.locale_str
 
 def em_title(t: str) -> discord.Embed:
@@ -536,19 +561,6 @@ async def setup_result_board(inter: discord.Interaction):
     await bot.db.commit()
     await inter.followup.send("勝負結果掲示板を用意しました。", ephemeral=True)
 
-@bot.event
-async def on_ready():
-    try:
-        guild = bot.get_guild(917012290283384902)  # ←あなたのGuild ID
-        if guild:
-            cmds = await bot.tree.fetch_commands(guild=guild)
-            names = [f"{c.name} (localized: {getattr(c, 'name_localizations', None)})" for c in cmds]
-            logging.getLogger("yenbot").info(f"Guild commands: {len(cmds)} -> {names}")
-        else:
-            logging.getLogger("yenbot").warning("Guild not found in cache.")
-    except Exception as e:
-        logging.getLogger("yenbot").exception(e)
-
 # =============================
 # 🚀 起動
 # =============================
@@ -556,4 +568,3 @@ if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise SystemExit("環境変数 DISCORD_TOKEN が未設定です")
     bot.run(DISCORD_TOKEN)
-
