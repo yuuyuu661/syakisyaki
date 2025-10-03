@@ -1,3 +1,6 @@
+# Python 3.11 / discord.py 2.4.x / aiosqlite
+# ✅ 日本語UI（locale_str）/ ギルド即時同期 / 再登録クリアのオプション付き
+
 import os
 import asyncio
 import logging
@@ -19,10 +22,17 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "").split(",") if x.strip().isdigit()]
 
+# コマンド再登録クリア（古い定義を掃除してから同期）…必要な時だけ 1 に
+FORCE_REBUILD_CMDS = os.getenv("FORCE_REBUILD_CMDS", "0") == "1"
+
+# 権限ロール（数値ID）
 BALANCE_AUDIT_ROLE_ID = int(os.getenv("BALANCE_AUDIT_ROLE_ID", "0") or 0)
 ADJUST_ROLE_ID = int(os.getenv("ADJUST_ROLE_ID", "0") or 0)
 
+# 通貨名（表示用）
 CURRENCY_NAME = os.getenv("CURRENCY_NAME", "円")
+
+# DB パス
 DB_PATH = os.getenv("DB_PATH", "data.sqlite3")
 
 # =============================
@@ -68,7 +78,6 @@ CREATE TABLE IF NOT EXISTS contracts (
 # =============================
 # 🛠️ ユーティリティ
 # =============================
-
 def jst_now_str() -> str:
     return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -116,8 +125,8 @@ async def fetch_ticket_summary(db: aiosqlite.Connection, guild_id: int) -> Dict[
 
 async def upsert_board(db: aiosqlite.Connection, guild_id: int, channel_id: int, kind: str, message_id: int) -> None:
     await db.execute(
-        "INSERT INTO boards (guild_id, channel_id, kind, message_id) VALUES (?, ?, ?, ?)\n"
-        "ON CONFLICT(guild_id, channel_id, kind) DO UPDATE SET message_id=excluded.message_id",
+        "INSERT INTO boards (guild_id, channel_id, kind, message_id) VALUES (?, ?, ?, ?)"
+        " ON CONFLICT(guild_id, channel_id, kind) DO UPDATE SET message_id=excluded.message_id",
         (guild_id, channel_id, kind, message_id)
     )
 
@@ -130,8 +139,8 @@ async def get_board_message_id(db: aiosqlite.Connection, guild_id: int, channel_
 # 🤖 Bot セットアップ
 # =============================
 intents = discord.Intents.default()
-intents.members = True
-intents.message_content = False
+intents.members = True        # メンバー参照が必要
+intents.message_content = False  # スラッシュコマンドには不要
 
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger("yenbot")
@@ -142,13 +151,24 @@ class YenBot(commands.Bot):
         self.db: Optional[aiosqlite.Connection] = None
 
     async def setup_hook(self) -> None:
+        # DB
         self.db = await aiosqlite.connect(DB_PATH)
         await self.db.executescript(INIT_SQL)
         await self.db.commit()
-        # --- スラッシュコマンドの即時反映対策 ---
-        # 1) まずはグローバル定義を各ギルドにコピー
-        # 2) その後、各ギルドで個別同期（これで数秒で反映される）
+
+        # --- スラッシュ即時反映: グローバル→ギルドコピー + ギルド同期 ---
         if GUILD_IDS:
+            # クリアオプション（古い定義の掃除）
+            if FORCE_REBUILD_CMDS:
+                for gid in GUILD_IDS:
+                    obj = discord.Object(id=gid)
+                    try:
+                        self.tree.clear_commands(guild=obj)
+                        cleared = await self.tree.sync(guild=obj)
+                        logger.info(f"Cleared {len(cleared)} commands from guild {gid}")
+                    except Exception as e:
+                        logger.exception(e)
+
             for gid in GUILD_IDS:
                 obj = discord.Object(id=gid)
                 try:
@@ -158,31 +178,12 @@ class YenBot(commands.Bot):
                 except Exception as e:
                     logger.exception(e)
         else:
-            # グローバル同期（反映に最大1時間かかる）
+            # グローバル同期（反映に時間がかかる）
             synced = await self.tree.sync()
             logger.info(f"Synced {len(synced)} global commands")
 
 bot = YenBot()
-
-@bot.event
-async def on_ready():
-    try:
-        if GUILD_IDS:
-            for gid in GUILD_IDS:
-                guild = bot.get_guild(gid)
-                if guild:
-                    cmds = await bot.tree.fetch_commands(guild=guild)
-                    names = [c.name for c in cmds]
-                    logger.info(f"Guild {gid} commands: {len(cmds)} -> {names}")
-                else:
-                    logger.warning(f"Guild {gid} not found in cache.")
-        else:
-            cmds = await bot.tree.fetch_commands()
-            names = [c.name for c in cmds]
-            logger.info(f"Global commands: {len(cmds)} -> {names}")
-    except Exception:
-        logger.exception("Failed to fetch commands on_ready")
-ls = app_commands.locale_str
+ls = app_commands.locale_str  # 日本語UI用ローカライズ
 
 def em_title(t: str) -> discord.Embed:
     return discord.Embed(title=t, color=0x2ecc71, timestamp=datetime.now(JST))
@@ -493,8 +494,8 @@ async def contract_close(inter: discord.Interaction, opponent: discord.Member, r
     assert guild is not None
 
     cur = await bot.db.execute(
-        "SELECT id, content FROM contracts \n"
-        "WHERE guild_id=? AND ((initiator=? AND opponent=?) OR (initiator=? AND opponent=?))\n"
+        "SELECT id, content FROM contracts "
+        "WHERE guild_id=? AND ((initiator=? AND opponent=?) OR (initiator=? AND opponent=?)) "
         "AND status='accepted' ORDER BY id DESC LIMIT 1",
         (guild.id, inter.user.id, opponent.id, opponent.id, inter.user.id)
     )
@@ -560,6 +561,28 @@ async def setup_result_board(inter: discord.Interaction):
     await upsert_board(bot.db, inter.guild.id, inter.channel.id, "contract_result", msg.id)  # type: ignore
     await bot.db.commit()
     await inter.followup.send("勝負結果掲示板を用意しました。", ephemeral=True)
+
+# =============================
+# 🟢 起動時の確認ログ
+# =============================
+@bot.event
+async def on_ready():
+    try:
+        if GUILD_IDS:
+            for gid in GUILD_IDS:
+                guild = bot.get_guild(gid)
+                if guild:
+                    cmds = await bot.tree.fetch_commands(guild=guild)
+                    names = [c.name for c in cmds]
+                    logger.info(f"Guild {gid} commands: {len(cmds)} -> {names}")
+                else:
+                    logger.warning(f"Guild {gid} not found in cache.")
+        else:
+            cmds = await bot.tree.fetch_commands()
+            names = [c.name for c in cmds]
+            logger.info(f"Global commands: {len(cmds)} -> {names}")
+    except Exception:
+        logger.exception("Failed to fetch commands on_ready")
 
 # =============================
 # 🚀 起動
