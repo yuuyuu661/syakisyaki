@@ -326,7 +326,7 @@ async def service_create(
 # =============================
 # 🧾 チケット掲示板（自動更新）
 # =============================
-async def update_ticket_board_message(channel: discord.abc.MessageableChannel):
+async def update_ticket_board_message(channel: discord.abc.Messageable):
     assert bot.db is not None
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
         return
@@ -390,7 +390,7 @@ class ContractView(discord.ui.View):
     @discord.ui.button(label="拒否", style=discord.ButtonStyle.danger)
     async def decline(self, inter: discord.Interaction, btn: discord.ui.Button):
         assert bot.db is not None
-        await bot.db.execute("UPDATE contracts SET status='declined' WHERE id=?", (self.contract_id))
+        await bot.db.execute("UPDATE contracts SET status='declined' WHERE id=?", (self.contract_id,))
         await bot.db.commit()
         await inter.response.edit_message(view=None)
         await inter.channel.send(f"❌ 契約が拒否されました。<@{self.initiator_id}> vs <@{self.opponent_id}>")
@@ -497,7 +497,7 @@ async def contract_close(inter: discord.Interaction, opponent: discord.Member, r
     )
     await inter.response.send_message(embed=e, view=ResultConfirmView(confirmer_id, on_confirm))
 
-async def append_result_board(channel: discord.abc.MessageableChannel, user_a: discord.Member, user_b: discord.Member, content: str, result: str):
+async def append_result_board(channel: discord.abc.Messageable, user_a: discord.Member, user_b: discord.Member, content: str, result: str):
     assert bot.db is not None
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
         return
