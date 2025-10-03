@@ -89,5 +89,5 @@ def jst_now_str() -> str:
     return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
 
 
-
 await inter.followup.send("勝負結果掲示板を用意しました。", ephemeral=True)
+
