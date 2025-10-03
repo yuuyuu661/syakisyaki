@@ -1,5 +1,7 @@
 # Python 3.11 / discord.py 2.4.x / aiosqlite
-# ✅ 日本語UI（locale_str）/ ギルド即時同期 / 再登録クリアのオプション付き
+# ✅ JP+EN UI（locale_str）/ ギルド即時同期（copy→sync）/ 再登録クリアオプション
+# ✅ 掲示板は固定チャンネルにのみ出力（個別の公開メッセージなし）
+# ✅ サービスチケットの管理用コマンド（ユーザー・サービス名・減らす枚数）追加
 
 import os
 import asyncio
@@ -22,7 +24,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "").split(",") if x.strip().isdigit()]
 
-# コマンド再登録クリア（古い定義を掃除してから同期）…必要な時だけ 1 に
+# コマンド再登録クリア（古い定義を掃除してから同期）…必要な時だけ 1
 FORCE_REBUILD_CMDS = os.getenv("FORCE_REBUILD_CMDS", "0") == "1"
 
 # 権限ロール（数値ID）
@@ -31,6 +33,10 @@ ADJUST_ROLE_ID = int(os.getenv("ADJUST_ROLE_ID", "0") or 0)
 
 # 通貨名（表示用）
 CURRENCY_NAME = os.getenv("CURRENCY_NAME", "円")
+
+# 固定掲示板チャンネル
+TICKET_BOARD_CHANNEL_ID = int(os.getenv("TICKET_BOARD_CHANNEL_ID", "0") or 0)
+RESULT_BOARD_CHANNEL_ID = int(os.getenv("RESULT_BOARD_CHANNEL_ID", "0") or 0)
 
 # DB パス
 DB_PATH = os.getenv("DB_PATH", "data.sqlite3")
@@ -116,6 +122,18 @@ async def add_ticket(db: aiosqlite.Connection, guild_id: int, user_id: int, labe
     row = await cur.fetchone()
     return int(row[0]) if row else 0
 
+async def set_ticket(db: aiosqlite.Connection, guild_id: int, user_id: int, label: str, count: int) -> int:
+    await db.execute(
+        "INSERT OR REPLACE INTO tickets (guild_id, user_id, label, count) VALUES (?, ?, ?, ?)",
+        (guild_id, user_id, label, count)
+    )
+    cur = await db.execute(
+        "SELECT count FROM tickets WHERE guild_id=? AND user_id=? AND label=?",
+        (guild_id, user_id, label)
+    )
+    row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
 async def fetch_ticket_summary(db: aiosqlite.Connection, guild_id: int) -> Dict[int, Dict[str, int]]:
     cur = await db.execute("SELECT user_id, label, count FROM tickets WHERE guild_id=? ORDER BY user_id, label", (guild_id,))
     out: Dict[int, Dict[str, int]] = {}
@@ -139,8 +157,8 @@ async def get_board_message_id(db: aiosqlite.Connection, guild_id: int, channel_
 # 🤖 Bot セットアップ
 # =============================
 intents = discord.Intents.default()
-intents.members = True        # メンバー参照が必要
-intents.message_content = False  # スラッシュコマンドには不要
+intents.members = True
+intents.message_content = False
 
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger("yenbot")
@@ -151,14 +169,12 @@ class YenBot(commands.Bot):
         self.db: Optional[aiosqlite.Connection] = None
 
     async def setup_hook(self) -> None:
-        # DB
         self.db = await aiosqlite.connect(DB_PATH)
         await self.db.executescript(INIT_SQL)
         await self.db.commit()
 
         # --- スラッシュ即時反映: グローバル→ギルドコピー + ギルド同期 ---
         if GUILD_IDS:
-            # クリアオプション（古い定義の掃除）
             if FORCE_REBUILD_CMDS:
                 for gid in GUILD_IDS:
                     obj = discord.Object(id=gid)
@@ -168,7 +184,6 @@ class YenBot(commands.Bot):
                         logger.info(f"Cleared {len(cleared)} commands from guild {gid}")
                     except Exception as e:
                         logger.exception(e)
-
             for gid in GUILD_IDS:
                 obj = discord.Object(id=gid)
                 try:
@@ -178,53 +193,89 @@ class YenBot(commands.Bot):
                 except Exception as e:
                     logger.exception(e)
         else:
-            # グローバル同期（反映に時間がかかる）
             synced = await self.tree.sync()
             logger.info(f"Synced {len(synced)} global commands")
 
 bot = YenBot()
-ls = app_commands.locale_str  # 日本語UI用ローカライズ
-
+ls = app_commands.locale_str  # JP/EN ローカライズ
 def em_title(t: str) -> discord.Embed:
     return discord.Embed(title=t, color=0x2ecc71, timestamp=datetime.now(JST))
 
 # =============================
-# 💱 送金（UI名: 送金）
+# 🔔 固定掲示板ユーティリティ
 # =============================
-@bot.tree.command(name=ls("send", ja="送金"), description=ls("Send currency", ja="ユーザーへ送金します"))
-@app_commands.describe(user="送金先ユーザー", amount="金額（整数）", note="一言（任意）")
+async def _get_fixed_channel(guild: discord.Guild, channel_id: int) -> Optional[discord.TextChannel]:
+    ch = guild.get_channel(channel_id)
+    return ch if isinstance(ch, discord.TextChannel) else None
+
+async def ensure_board_message(guild: discord.Guild, kind: str) -> Optional[discord.Message]:
+    """固定チャンネルに掲示板メッセージを作成/取得"""
+    assert bot.db is not None
+    channel_id = TICKET_BOARD_CHANNEL_ID if kind == "ticket" else RESULT_BOARD_CHANNEL_ID
+    if not channel_id:
+        return None
+    ch = await _get_fixed_channel(guild, channel_id)
+    if not ch:
+        return None
+
+    msg_id = await get_board_message_id(bot.db, guild.id, ch.id, kind)
+    if msg_id:
+        try:
+            return await ch.fetch_message(msg_id)
+        except discord.NotFound:
+            pass  # 消えていれば新規作成
+
+    # 初期メッセージ
+    title = "サービスチケット掲示板（自動更新） / Ticket Board (auto-update)" if kind == "ticket" else "勝負結果掲示板（自動更新） / Result Board (auto-update)"
+    e = em_title(title)
+    e.description = "ここに内容が自動更新されます。\nThis message is automatically updated."
+    msg = await ch.send(embed=e)
+    await upsert_board(bot.db, guild.id, ch.id, kind, msg.id)
+    await bot.db.commit()
+    return msg
+
+# =============================
+# 💱 送金（/send → 表示名: 送金 / Send）
+# =============================
+@bot.tree.command(
+    name=ls("send", ja="送金"),
+    description=ls("Send currency to a user", ja="ユーザーへ送金します")
+)
+@app_commands.describe(
+    user="送金先 / Recipient",
+    amount="金額（整数）/ Amount (int)",
+    note="一言（任意）/ Note (optional)"
+)
 async def send(inter: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, 10_000_000], note: Optional[str] = None):
     assert bot.db is not None
     guild = inter.guild
     assert guild is not None
 
     if user.bot:
-        await inter.response.send_message("Bot へは送金できません。", ephemeral=True)
+        await inter.response.send_message("Bot へは送金できません / Cannot send to bots.", ephemeral=True)
         return
 
     async with bot.db.execute("BEGIN"):
         sender_bal = await get_balance(bot.db, guild.id, inter.user.id)
         if sender_bal < amount:
-            await inter.response.send_message(f"残高不足です。現在残高: {sender_bal}{CURRENCY_NAME}", ephemeral=True)
+            await inter.response.send_message(f"残高不足 / Insufficient balance: {sender_bal}{CURRENCY_NAME}", ephemeral=True)
             await bot.db.execute("ROLLBACK")
             return
         await add_balance(bot.db, guild.id, inter.user.id, -amount)
         await add_balance(bot.db, guild.id, user.id, amount)
         await bot.db.commit()
 
-    e = em_title("送金が完了しました")
-    e.add_field(name="送金者", value=inter.user.mention, inline=True)
-    e.add_field(name="受取人", value=user.mention, inline=True)
-    e.add_field(name="金額", value=f"{amount}{CURRENCY_NAME}", inline=True)
-    if note:
-        e.add_field(name="一言", value=note, inline=False)
-    await inter.response.send_message(embed=e)
+    # 公開メッセージは出さない → 最小限のエフェメラルのみ
+    await inter.response.send_message("送金しました / Sent.", ephemeral=True)
 
 # =============================
-# 🧾 残高確認（UI名: 残高確認）
+# 🧾 残高確認（/balance → 残高確認 / Balance）
 # =============================
-@bot.tree.command(name=ls("balance", ja="残高確認"), description=ls("Check balance", ja="自分または特定ユーザーの残高を確認します"))
-@app_commands.describe(user="対象ユーザー（未指定なら自分）")
+@bot.tree.command(
+    name=ls("balance", ja="残高確認"),
+    description=ls("Check your or someone's balance", ja="自分または特定ユーザーの残高を確認します")
+)
+@app_commands.describe(user="対象（未指定なら自分）/ Target (self if omitted)")
 async def balance(inter: discord.Interaction, user: Optional[discord.Member] = None):
     assert bot.db is not None
     guild = inter.guild
@@ -234,23 +285,26 @@ async def balance(inter: discord.Interaction, user: Optional[discord.Member] = N
     if target.id != inter.user.id:
         if BALANCE_AUDIT_ROLE_ID and isinstance(inter.user, discord.Member):
             if discord.utils.get(inter.user.roles, id=BALANCE_AUDIT_ROLE_ID) is None:
-                await inter.response.send_message("他ユーザーの残高参照権限がありません。", ephemeral=True)
+                await inter.response.send_message("権限がありません / No permission.", ephemeral=True)
                 return
         else:
-            await inter.response.send_message("他ユーザーの残高参照権限がありません。", ephemeral=True)
+            await inter.response.send_message("権限がありません / No permission.", ephemeral=True)
             return
 
     bal = await get_balance(bot.db, guild.id, target.id)
-    e = em_title("残高確認")
-    e.add_field(name="ユーザー", value=target.mention, inline=True)
-    e.add_field(name="残高", value=f"{bal}{CURRENCY_NAME}", inline=True)
-    await inter.response.send_message(embed=e, ephemeral=(target.id == inter.user.id))
+    e = em_title("残高 / Balance")
+    e.add_field(name="ユーザー / User", value=target.mention, inline=True)
+    e.add_field(name="残高 / Amount", value=f"{bal}{CURRENCY_NAME}", inline=True)
+    await inter.response.send_message(embed=e, ephemeral=True)
 
 # =============================
-# 🧮 金額調整（UI名: 金額調整）
+# 🧮 金額調整（/adjust → 金額調整 / Adjust）
 # =============================
-@bot.tree.command(name=ls("adjust", ja="金額調整"), description=ls("Adjust balance (admin)", ja="管理者が残高を調整します（例: +100, -50）"))
-@app_commands.describe(user="対象ユーザー", delta="+N または -N の形式")
+@bot.tree.command(
+    name=ls("adjust", ja="金額調整"),
+    description=ls("Adjust balance (admin)", ja="管理者が残高を調整します（例: +100, -50）")
+)
+@app_commands.describe(user="対象ユーザー / Target user", delta="+N または -N / +N or -N")
 async def adjust(inter: discord.Interaction, user: discord.Member, delta: str):
     assert bot.db is not None
     guild = inter.guild
@@ -258,15 +312,15 @@ async def adjust(inter: discord.Interaction, user: discord.Member, delta: str):
 
     if ADJUST_ROLE_ID and isinstance(inter.user, discord.Member):
         if discord.utils.get(inter.user.roles, id=ADJUST_ROLE_ID) is None:
-            await inter.response.send_message("金額調整の権限がありません。", ephemeral=True)
+            await inter.response.send_message("権限がありません / No permission.", ephemeral=True)
             return
     else:
-        await inter.response.send_message("金額調整の権限がありません。", ephemeral=True)
+        await inter.response.send_message("権限がありません / No permission.", ephemeral=True)
         return
 
     m = re.fullmatch(r"([+-])(\d+)", delta.strip())
     if not m:
-        await inter.response.send_message("形式エラー: +100 や -50 のように指定してください。", ephemeral=True)
+        await inter.response.send_message("形式エラー: +100 や -50 / Format: +100 or -50", ephemeral=True)
         return
     sign, num = m.group(1), int(m.group(2))
     amount = num if sign == "+" else -num
@@ -274,14 +328,14 @@ async def adjust(inter: discord.Interaction, user: discord.Member, delta: str):
     new_bal = await add_balance(bot.db, guild.id, user.id, amount)
     await bot.db.commit()
 
-    e = em_title("残高調整")
-    e.add_field(name="対象", value=user.mention, inline=True)
-    e.add_field(name="変動", value=f"{amount:+d}{CURRENCY_NAME}", inline=True)
-    e.add_field(name="新残高", value=f"{new_bal}{CURRENCY_NAME}", inline=True)
-    await inter.response.send_message(embed=e)
+    e = em_title("残高調整 / Adjust")
+    e.add_field(name="対象 / User", value=user.mention, inline=True)
+    e.add_field(name="変動 / Δ", value=f"{amount:+d}{CURRENCY_NAME}", inline=True)
+    e.add_field(name="新残高 / New", value=f"{new_bal}{CURRENCY_NAME}", inline=True)
+    await inter.response.send_message(embed=e, ephemeral=True)
 
 # =============================
-# 🎟️ サービス作成（UI名: サービス作成）
+# 🎟️ サービス作成（/service_create）
 # =============================
 class ServiceButton(discord.ui.Button):
     def __init__(self, label: str, price: int):
@@ -290,24 +344,22 @@ class ServiceButton(discord.ui.Button):
         self.price = price
 
     async def callback(self, inter: discord.Interaction):
+        # 個別に公開メッセージは出さない（ephemeral最小限）＋固定掲示板のみ更新
         assert bot.db is not None
         guild = inter.guild
         assert guild is not None
 
         bal = await get_balance(bot.db, guild.id, inter.user.id)
         if bal < self.price:
-            await inter.response.send_message(f"残高が足りません。現在 {bal}{CURRENCY_NAME}", ephemeral=True)
+            await inter.response.send_message(f"残高不足 / Insufficient: {bal}{CURRENCY_NAME}", ephemeral=True)
             return
+
         await add_balance(bot.db, guild.id, inter.user.id, -self.price)
-        new_count = await add_ticket(bot.db, guild.id, inter.user.id, self.raw_label, 1)
+        await add_ticket(bot.db, guild.id, inter.user.id, self.raw_label, 1)
         await bot.db.commit()
 
-        await inter.response.send_message(
-            f"{self.raw_label} のチケットを1枚取得しました（所持: {new_count}）。残高 {bal - self.price}{CURRENCY_NAME}",
-            ephemeral=True
-        )
-
-        await update_ticket_board_message(inter.channel)  # type: ignore
+        await inter.response.send_message("購入完了 / Purchased.", ephemeral=True)
+        await update_ticket_board()  # 固定チャンネルの掲示板を更新
 
 class ServiceView(discord.ui.View):
     def __init__(self, pairs: List[Tuple[str, int]]):
@@ -315,16 +367,19 @@ class ServiceView(discord.ui.View):
         for label, price in pairs:
             self.add_item(ServiceButton(label, price))
 
-@bot.tree.command(name=ls("service_create", ja="サービス作成"), description=ls("Create service panel", ja="サービス販売パネルを作成"))
+@bot.tree.command(
+    name=ls("service_create", ja="サービス作成"),
+    description=ls("Create service panel (ticket vending)", ja="サービス販売パネルを作成（チケット付与）")
+)
 @app_commands.describe(
-    title="サービスのタイトル",
-    description="サービスの紹介",
-    label1="ボタン1 文言", price1="ボタン1 金額",
-    label2="ボタン2 文言", price2="ボタン2 金額",
-    label3="ボタン3 文言", price3="ボタン3 金額",
-    label4="ボタン4 文言", price4="ボタン4 金額",
-    label5="ボタン5 文言", price5="ボタン5 金額",
-    label6="ボタン6 文言", price6="ボタン6 金額",
+    title="サービスのタイトル / Panel title",
+    description="サービスの紹介 / Description",
+    label1="ボタン1 文言 / Button1 label", price1="ボタン1 金額 / Button1 price",
+    label2="ボタン2 文言 / Button2 label", price2="ボタン2 金額 / Button2 price",
+    label3="ボタン3 文言 / Button3 label", price3="ボタン3 金額 / Button3 price",
+    label4="ボタン4 文言 / Button4 label", price4="ボタン4 金額 / Button4 price",
+    label5="ボタン5 文言 / Button5 label", price5="ボタン5 金額 / Button5 price",
+    label6="ボタン6 文言 / Button6 label", price6="ボタン6 金額 / Button6 price",
 )
 async def service_create(
     inter: discord.Interaction,
@@ -342,55 +397,91 @@ async def service_create(
         if lab and pr and pr > 0:
             pairs.append((lab.strip(), int(pr)))
     if not pairs:
-        await inter.response.send_message("少なくとも1つのボタンを指定してください。", ephemeral=True)
+        await inter.response.send_message("少なくとも1つのボタンが必要です / At least 1 button required.", ephemeral=True)
         return
 
-    e = em_title(title)
+    e = em_title(f"{title}")
     e.description = description
     await inter.response.send_message(embed=e, view=ServiceView(pairs))
 
 # =============================
-# 🧾 チケット掲示板（自動更新）
+# 🧾 固定：チケット掲示板（自動更新）
 # =============================
-async def update_ticket_board_message(channel: discord.abc.Messageable):
+async def update_ticket_board():
+    """固定チャンネルのチケット掲示板を最新化"""
     assert bot.db is not None
-    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        return
-    guild = channel.guild
-
-    msg_id = await get_board_message_id(bot.db, guild.id, channel.id, "ticket")
-    summary = await fetch_ticket_summary(bot.db, guild.id)
-
-    e = em_title("サービスチケット掲示板（自動更新）")
-    if not summary:
-        e.description = "まだチケットの購入はありません。"
-    else:
-        lines = []
-        for uid, labels in summary.items():
-            member = guild.get_member(uid)
-            name = member.mention if member else f"<@{uid}>"
-            label_str = " / ".join([f"{lbl}:{cnt}" for lbl, cnt in labels.items()])
-            lines.append(f"{name}: {label_str}")
-        e.description = "\n".join(lines)[:4000]
-
-    try:
-        if msg_id:
-            msg = await channel.fetch_message(msg_id)
-            await msg.edit(embed=e)
+    # ギルド1つ運用前提（複数対応ならループで）
+    for gid in GUILD_IDS:
+        guild = bot.get_guild(gid)
+        if not guild:
+            continue
+        msg = await ensure_board_message(guild, "ticket")
+        if not msg:
+            continue
+        summary = await fetch_ticket_summary(bot.db, guild.id)
+        e = em_title("サービスチケット掲示板（自動更新） / Ticket Board")
+        if not summary:
+            e.description = "まだチケットの購入はありません。\nNo purchases yet."
         else:
-            msg = await channel.send(embed=e)
-            await upsert_board(bot.db, guild.id, channel.id, "ticket", msg.id)
-            await bot.db.commit()
-    except discord.Forbidden:
-        logger.warning("掲示板更新に失敗: 権限不足")
-    except discord.HTTPException:
-        logger.exception("掲示板更新に失敗: HTTPException")
+            lines = []
+            for uid, labels in summary.items():
+                member = guild.get_member(uid)
+                name = member.mention if member else f"<@{uid}>"
+                for lbl, cnt in labels.items():
+                    lines.append(f"{name} | {lbl} | {cnt}")
+            e.description = "\n".join(lines)[:4000]
+        try:
+            await msg.edit(embed=e)
+        except Exception:
+            logger.exception("Failed to edit ticket board")
 
-@bot.tree.command(name=ls("setup_ticket_board", ja="チケット掲示板作成"), description=ls("Create ticket board", ja="このチャンネルにチケット掲示板を作成 / 再作成"))
+@bot.tree.command(
+    name=ls("setup_ticket_board", ja="チケット掲示板作成"),
+    description=ls("Create/refresh ticket board (fixed channel)", ja="固定チャンネルにチケット掲示板を作成/再作成します")
+)
 async def setup_ticket_board(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True)
-    await update_ticket_board_message(inter.channel)  # type: ignore
-    await inter.followup.send("チケット掲示板を用意しました（以後、自動更新）。", ephemeral=True)
+    await update_ticket_board()
+    await inter.followup.send("チケット掲示板を用意/更新しました（固定CH）。", ephemeral=True)
+
+# =============================
+# 🛠 管理: サービスチケット調整（減らす枚数）
+# =============================
+@bot.tree.command(
+    name=ls("service_ticket_adjust", ja="サービスチケット調整"),
+    description=ls("Adjust service tickets for a user", ja="ユーザーのサービスチケット枚数を調整します")
+)
+@app_commands.describe(
+    user="ユーザー / User",
+    service="サービス名（ラベル）/ Service label",
+    dec="減らす枚数（正数）/ Decrease count (positive)"
+)
+async def service_ticket_adjust(inter: discord.Interaction, user: discord.Member, service: str, dec: app_commands.Range[int, 1, 10_000]):
+    assert bot.db is not None
+    guild = inter.guild
+    assert guild is not None
+
+    if ADJUST_ROLE_ID and isinstance(inter.user, discord.Member):
+        if discord.utils.get(inter.user.roles, id=ADJUST_ROLE_ID) is None:
+            await inter.response.send_message("権限がありません / No permission.", ephemeral=True)
+            return
+    else:
+        await inter.response.send_message("権限がありません / No permission.", ephemeral=True)
+        return
+
+    # 現在値を取得 → 減算（マイナスは0で止める）
+    cur = await bot.db.execute(
+        "SELECT count FROM tickets WHERE guild_id=? AND user_id=? AND label=?",
+        (guild.id, user.id, service)
+    )
+    row = await cur.fetchone()
+    current = int(row[0]) if row else 0
+    new_count = max(0, current - int(dec))
+    await set_ticket(bot.db, guild.id, user.id, service, new_count)
+    await bot.db.commit()
+
+    await inter.response.send_message(f"調整完了: {user.mention} / {service} / {current} → {new_count}", ephemeral=True)
+    await update_ticket_board()
 
 # =============================
 # 🤝 契約（提案/承諾/拒否/タイムアウト）
@@ -405,36 +496,40 @@ class ContractView(discord.ui.View):
     async def interaction_check(self, inter: discord.Interaction) -> bool:
         return inter.user.id == self.opponent_id
 
-    @discord.ui.button(label="承諾", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="承諾 / Accept", style=discord.ButtonStyle.success)
     async def accept(self, inter: discord.Interaction, btn: discord.ui.Button):
         assert bot.db is not None
         await bot.db.execute("UPDATE contracts SET status='accepted', accepted_at=? WHERE id=?", (jst_now_str(), self.contract_id))
         await bot.db.commit()
+        # 公開アナウンスは出さない
         await inter.response.edit_message(view=None)
-        await inter.channel.send(f"✅ 契約が承諾されました。<@{self.initiator_id}> vs <@{self.opponent_id}>")
+        await inter.followup.send("契約を承諾しました / Accepted.", ephemeral=True)
 
-    @discord.ui.button(label="拒否", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="拒否 / Decline", style=discord.ButtonStyle.danger)
     async def decline(self, inter: discord.Interaction, btn: discord.ui.Button):
         assert bot.db is not None
         await bot.db.execute("UPDATE contracts SET status='declined' WHERE id=?", (self.contract_id,))
         await bot.db.commit()
         await inter.response.edit_message(view=None)
-        await inter.channel.send(f"❌ 契約が拒否されました。<@{self.initiator_id}> vs <@{self.opponent_id}>")
+        await inter.followup.send("契約を拒否しました / Declined.", ephemeral=True)
 
     async def on_timeout(self) -> None:
         assert bot.db is not None
         await bot.db.execute("UPDATE contracts SET status='declined' WHERE id=? AND status='pending'", (self.contract_id,))
         await bot.db.commit()
 
-@bot.tree.command(name=ls("contract", ja="契約"), description=ls("Propose a contract", ja="勝負契約を相手に提示します（5分以内に承諾/拒否）"))
-@app_commands.describe(opponent="相手ユーザー", content="勝負の内容")
+@bot.tree.command(
+    name=ls("contract", ja="契約"),
+    description=ls("Propose a duel contract", ja="勝負契約を相手に提示します（5分以内に承諾/拒否）")
+)
+@app_commands.describe(opponent="相手 / Opponent", content="勝負の内容 / Content")
 async def contract(inter: discord.Interaction, opponent: discord.Member, content: str):
     assert bot.db is not None
     guild = inter.guild
     assert guild is not None
 
     if opponent.bot or opponent.id == inter.user.id:
-        await inter.response.send_message("相手ユーザーの指定が不正です。", ephemeral=True)
+        await inter.response.send_message("相手ユーザーの指定が不正 / Invalid opponent.", ephemeral=True)
         return
 
     created_at = jst_now_str()
@@ -448,8 +543,12 @@ async def contract(inter: discord.Interaction, opponent: discord.Member, content
     row = await cur.fetchone()
     contract_id = int(row[0])
 
-    e = em_title("契約の提案")
-    e.description = f"**{inter.user.mention}** vs **{opponent.mention}**\n\n**勝負内容:**\n{content}\n\n5分以内に承諾または拒否してください。"
+    e = em_title("契約の提案 / Contract Proposal")
+    e.description = (
+        f"**{inter.user.mention}** vs **{opponent.mention}**\n\n"
+        f"**勝負内容 / Content:**\n{content}\n\n"
+        f"5分以内に承諾または拒否してください / Accept or decline within 5 minutes."
+    )
     view = ContractView(inter.user.id, opponent.id, contract_id)
     await inter.response.send_message(embed=e, view=view)
 
@@ -460,14 +559,10 @@ async def contract(inter: discord.Interaction, opponent: discord.Member, content
         if r and r[0] == 'pending':
             await bot.db.execute("UPDATE contracts SET status='declined' WHERE id=?", (contract_id,))
             await bot.db.commit()
-            try:
-                await inter.channel.send(f"⌛ タイムアウト: 契約は拒否扱いになりました。（ID: {contract_id}）")
-            except Exception:
-                pass
     bot.loop.create_task(timeout_task())
 
 # =============================
-# ✅ 契約終了（相手の承認が必要）
+# ✅ 契約終了（相手の承認→固定“勝負結果掲示板”にのみ反映）
 # =============================
 class ResultConfirmView(discord.ui.View):
     def __init__(self, confirmer_id: int, on_confirm: Callable[[discord.Interaction], Awaitable[None]]):
@@ -478,12 +573,15 @@ class ResultConfirmView(discord.ui.View):
     async def interaction_check(self, inter: discord.Interaction) -> bool:
         return inter.user.id == self.confirmer_id
 
-    @discord.ui.button(label="承認", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="承認 / Approve", style=discord.ButtonStyle.success)
     async def approve(self, inter: discord.Interaction, btn: discord.ui.Button):
         await self.on_confirm(inter)
 
-@bot.tree.command(name=ls("contract_close", ja="契約終了"), description=ls("Submit duel result", ja="勝負の結果を申請します（相手の承認が必要）"))
-@app_commands.describe(opponent="勝負相手", result="あなたの結果")
+@bot.tree.command(
+    name=ls("contract_close", ja="契約終了"),
+    description=ls("Submit duel result", ja="勝負の結果を申請します（相手の承認が必要）")
+)
+@app_commands.describe(opponent="勝負相手 / Opponent", result="あなたの結果 / Your result")
 @app_commands.choices(result=[
     app_commands.Choice(name=ls("win", ja="勝利"), value="win"),
     app_commands.Choice(name=ls("lose", ja="敗北"), value="lose"),
@@ -501,7 +599,7 @@ async def contract_close(inter: discord.Interaction, opponent: discord.Member, r
     )
     row = await cur.fetchone()
     if not row:
-        await inter.response.send_message("承諾済みの契約が見つかりません。", ephemeral=True)
+        await inter.response.send_message("承諾済みの契約が見つかりません / No accepted contract found.", ephemeral=True)
         return
     cid, content = int(row[0]), str(row[1])
 
@@ -511,59 +609,58 @@ async def contract_close(inter: discord.Interaction, opponent: discord.Member, r
         await bot.db.execute("UPDATE contracts SET status='closed' WHERE id=?", (cid,))
         await bot.db.commit()
         await confirm_inter.response.edit_message(view=None)
-        await confirm_inter.channel.send("✅ 勝負結果が確定しました。掲示板を更新します。")
-        await append_result_board(confirm_inter.channel, inter.user, opponent, content, result.value)
+        # 公開アナウンスは出さず、固定“勝負結果掲示板”のみ更新
+        await append_result_board(content, inter.user, opponent, result.value)
+        await confirm_inter.followup.send("結果を確定し掲示板を更新しました / Result confirmed.", ephemeral=True)
 
-    e = em_title("勝負結果の確認")
+    e = em_title("勝負結果の確認 / Result Confirmation")
     result_ja = "勝利" if result.value == "win" else "敗北"
     e.description = (
-        f"**勝負内容**\n{content}\n\n"
-        f"申請者: {inter.user.mention} → 結果: **{result_ja}**\n"
-        f"相手: {opponent.mention} の承認が必要です。"
+        f"**勝負内容 / Content**\n{content}\n\n"
+        f"申請者 / Submitter: {inter.user.mention} → 結果 / Result: **{result_ja}**\n"
+        f"相手 / Opponent: {opponent.mention} の承認が必要です / Needs opponent approval."
     )
     await inter.response.send_message(embed=e, view=ResultConfirmView(confirmer_id, on_confirm))
 
-async def append_result_board(channel: discord.abc.Messageable, user_a: discord.Member, user_b: discord.Member, content: str, result: str):
+async def append_result_board(content: str, user_a: discord.Member, user_b: discord.Member, result: str):
+    """固定チャンネルの勝負結果掲示板に追記（先頭に積む）"""
     assert bot.db is not None
-    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        return
-    guild = channel.guild
+    for gid in GUILD_IDS:
+        guild = bot.get_guild(gid)
+        if not guild:
+            continue
+        msg = await ensure_board_message(guild, "contract_result")
+        if not msg:
+            continue
 
-    msg_id = await get_board_message_id(bot.db, guild.id, channel.id, "contract_result")
+        symbol = "🏆" if result == "win" else "⚑"
+        line = f"{jst_now_str()} — {user_a.mention} vs {user_b.mention} → {user_a.mention} {('勝利' if result=='win' else '敗北')} {symbol}\n内容 / Content: {content}"
 
-    symbol = "🏆" if result == "win" else "⚑"
-    line = f"{jst_now_str()} — {user_a.mention} vs {user_b.mention} → {user_a.mention} {('勝利' if result=='win' else '敗北')} {symbol}\n内容: {content}"
-
-    e = em_title("勝負結果掲示板（自動更新）")
-
-    try:
-        if msg_id:
-            msg = await channel.fetch_message(msg_id)
-            old = msg.embeds[0].description if msg.embeds else ""
-            new_desc = (line + "\n" + (old or "")).strip()
-            e.description = new_desc[:4000]
+        e = em_title("勝負結果掲示板（自動更新） / Result Board")
+        old = msg.embeds[0].description if msg.embeds else ""
+        new_desc = (line + "\n" + (old or "")).strip()
+        e.description = new_desc[:4000]
+        try:
             await msg.edit(embed=e)
-        else:
-            e.description = line
-            msg = await channel.send(embed=e)
-            await upsert_board(bot.db, guild.id, channel.id, "contract_result", msg.id)
-            await bot.db.commit()
-    except Exception:
-        logger.exception("勝負結果掲示板の更新に失敗")
+        except Exception:
+            logger.exception("Failed to edit result board")
 
-@bot.tree.command(name=ls("setup_result_board", ja="勝負結果掲示板作成"), description=ls("Create result board", ja="このチャンネルに勝負結果掲示板を作成 / 再作成"))
+@bot.tree.command(
+    name=ls("setup_result_board", ja="勝負結果掲示板作成"),
+    description=ls("Create/refresh result board (fixed channel)", ja="固定チャンネルに勝負結果掲示板を作成/再作成します")
+)
 async def setup_result_board(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True)
-    e = em_title("勝負結果掲示板（自動更新）")
-    e.description = "ここに勝負結果が時系列で追記されます。"
-    msg = await inter.channel.send(embed=e)  # type: ignore
-    assert bot.db is not None
-    await upsert_board(bot.db, inter.guild.id, inter.channel.id, "contract_result", msg.id)  # type: ignore
-    await bot.db.commit()
-    await inter.followup.send("勝負結果掲示板を用意しました。", ephemeral=True)
+    # 初期行だけ作っておく
+    for gid in GUILD_IDS:
+        guild = bot.get_guild(gid)
+        if not guild:
+            continue
+        await ensure_board_message(guild, "contract_result")
+    await inter.followup.send("勝負結果掲示板を用意/更新しました（固定CH）。", ephemeral=True)
 
 # =============================
-# 🟢 起動時の確認ログ
+# 🟢 起動時ログ
 # =============================
 @bot.event
 async def on_ready():
@@ -584,44 +681,10 @@ async def on_ready():
     except Exception:
         logger.exception("Failed to fetch commands on_ready")
 
-# 🛠 デバッグ: このチャンネルでコマンドが見えるはずか？ を診断
-@bot.tree.command(name=ls("debug", ja="デバッグ"), description=ls("Debug command visibility", ja="コマンド可視性を診断します"))
-async def debug(inter: discord.Interaction):
-    # 1) ギルドに何コマンド登録済みか
-    guild_cmds = await bot.tree.fetch_commands(guild=inter.guild)  # type: ignore
-    names = [c.name for c in guild_cmds]
-
-    # 2) このチャンネルの権限（@everyone 目線）
-    everyone = inter.guild.default_role  # type: ignore
-    ch_perms_everyone = inter.channel.permissions_for(everyone)  # type: ignore
-
-    # 3) Bot 自身の権限
-    me_member = inter.guild.me  # type: ignore
-    ch_perms_me = inter.channel.permissions_for(me_member)  # type: ignore
-
-    def yn(b: bool) -> str:
-        return "✅" if b else "❌"
-
-    # discord.py 2.x Permissions フラグ
-    can_use_app_cmds_everyone = getattr(ch_perms_everyone, "use_application_commands", False)
-    can_use_app_cmds_me = getattr(ch_perms_me, "use_application_commands", False)
-    can_send = ch_perms_me.send_messages and ch_perms_me.read_messages and ch_perms_me.read_message_history
-    can_embed = ch_perms_me.embed_links
-
-    e = discord.Embed(title="デバッグ: コマンド可視性", color=0x95a5a6)
-    e.add_field(name="登録コマンド数", value=str(len(guild_cmds)), inline=True)
-    e.add_field(name="登録コマンド一覧", value=", ".join(names) or "(なし)", inline=False)
-    e.add_field(name="このチャンネルの @everyone", value=f"Use Application Commands: {yn(can_use_app_cmds_everyone)}", inline=False)
-    e.add_field(name="このチャンネルの Bot 権限", value=(
-        f"Use Application Commands: {yn(can_use_app_cmds_me)}\n"
-        f"Send Messages: {yn(can_send)} / Embed Links: {yn(can_embed)}"
-    ), inline=False)
-    await inter.response.send_message(embed=e, ephemeral=True)
 # =============================
 # 🚀 起動
 # =============================
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        raise SystemExit("環境変数 DISCORD_TOKEN が未設定です")
+        raise SystemExit("環境変数 DISCORD_TOKEN が未設定です / DISCORD_TOKEN missing")
     bot.run(DISCORD_TOKEN)
-
