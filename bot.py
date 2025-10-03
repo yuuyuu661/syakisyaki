@@ -536,6 +536,19 @@ async def setup_result_board(inter: discord.Interaction):
     await bot.db.commit()
     await inter.followup.send("勝負結果掲示板を用意しました。", ephemeral=True)
 
+@bot.event
+async def on_ready():
+    try:
+        guild = bot.get_guild(917012290283384902)  # ←あなたのGuild ID
+        if guild:
+            cmds = await bot.tree.fetch_commands(guild=guild)
+            names = [f"{c.name} (localized: {getattr(c, 'name_localizations', None)})" for c in cmds]
+            logging.getLogger("yenbot").info(f"Guild commands: {len(cmds)} -> {names}")
+        else:
+            logging.getLogger("yenbot").warning("Guild not found in cache.")
+    except Exception as e:
+        logging.getLogger("yenbot").exception(e)
+
 # =============================
 # 🚀 起動
 # =============================
@@ -543,3 +556,4 @@ if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise SystemExit("環境変数 DISCORD_TOKEN が未設定です")
     bot.run(DISCORD_TOKEN)
+
